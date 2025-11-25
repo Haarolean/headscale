@@ -7,6 +7,10 @@ on:
       - "*" # triggers only if push new tag version
   workflow_dispatch:
 
+permissions:
+  packages: write
+  id-token: write
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
