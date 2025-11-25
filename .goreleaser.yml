@@ -119,7 +119,7 @@ nfpms:
 kos:
   - id: ghcr
     repositories:
-      - ghcr.io/juanfont/headscale
+      - ghcr.io/haarolean/headscale
       - headscale/headscale
 
     # bare tells KO to only use the repository
@@ -150,7 +150,7 @@ kos:
 
   - id: ghcr-debug
     repositories:
-      - ghcr.io/juanfont/headscale
+      - ghcr.io/haarolean/headscale
       - headscale/headscale
 
     bare: true
