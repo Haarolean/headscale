@@ -456,3 +456,221 @@ func TestAuthKeyLogoutAndReloginSameUserExpiredKey(t *testing.T) {
 	}
 }
 
+// TestAuthKeyMoveNode tests Issue #2830: node moved to another user should still reconnect.
+// Scenario from user report: "Moving the node back and forth reproduces the issue"
+// Steps:
+// 1. Create node under user1 with auth key owned by user1
+// 2. Move node to user2 (auth key still owned by user1)
+// 3. Restart node - should successfully reconnect using MachineKey identity
+func TestAuthKeyMoveNode(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario, err := NewScenario(ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{"user1", "user2"},
+	})
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("movenode"), hsic.WithTLS(), hsic.WithDERPAsIP())
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+	require.Len(t, allClients, 2, "Should have 2 clients")
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	headscale, err := scenario.Headscale()
+	requireNoErrGetHeadscale(t, err)
+
+	// Get user1's node
+	user1Nodes, err := headscale.ListNodes("user1")
+	require.NoError(t, err)
+	require.Len(t, user1Nodes, 1)
+	nodeID := user1Nodes[0].GetId()
+	nodeName := user1Nodes[0].GetName()
+
+	t.Logf("Node %d (%s) currently owned by user1", nodeID, nodeName)
+
+	// Find the corresponding client
+	var client1 TailscaleClient
+	for _, c := range allClients {
+		hostname, _ := c.FQDN()
+		if hostname == nodeName {
+			client1 = c
+			break
+		}
+	}
+	require.NotNil(t, client1, "Could not find client for node")
+
+	// Move node from user1 to user2
+	t.Logf("Moving node %d to user2", nodeID)
+	_, err = headscale.Execute([]string{
+		"headscale",
+		"nodes",
+		"move",
+		"--identifier",
+		fmt.Sprintf("%d", nodeID),
+		"--user",
+		"user2",
+	})
+	require.NoError(t, err)
+
+	// Verify move succeeded
+	user2Nodes, err := headscale.ListNodes("user2")
+	require.NoError(t, err)
+	require.Len(t, user2Nodes, 2, "user2 should now have 2 nodes")
+
+	// Simulate node restart (down + up)
+	t.Logf("Restarting node after move")
+	err = client1.Down()
+	require.NoError(t, err)
+
+	time.Sleep(3 * time.Second)
+
+	err = client1.Up()
+	require.NoError(t, err)
+
+	// Verify node comes back online
+	// This will FAIL without the fix because auth key validation will reject it
+	// With the fix, MachineKey identity allows reconnection
+	requireAllClientsOnline(t, headscale, []types.NodeID{types.NodeID(nodeID)}, true, "moved node should reconnect after restart", 120*time.Second)
+
+	t.Logf("✓ Node successfully reconnected after being moved to different user")
+}
+
+// TestAuthKeyDeleteKey tests Issue #2830: node with expired/deleted auth key should still reconnect.
+// Scenario from user report: "create node, delete the auth key, restart to validate it can connect"
+// Steps:
+// 1. Create node with auth key
+// 2. Expire the auth key
+// 3. Restart node - should successfully reconnect using MachineKey identity
+func TestAuthKeyDeleteKey(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario, err := NewScenario(ScenarioSpec{
+		NodesPerUser: 1, // Start with one node
+		Users:        []string{"user1"},
+	})
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("delkey"), hsic.WithTLS(), hsic.WithDERPAsIP())
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+	require.Len(t, allClients, 1, "Should have 1 client")
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	headscale, err := scenario.Headscale()
+	requireNoErrGetHeadscale(t, err)
+
+	// Get the node that was created
+	user1Nodes, err := headscale.ListNodes("user1")
+	require.NoError(t, err)
+	require.Len(t, user1Nodes, 1)
+	nodeID := user1Nodes[0].GetId()
+	nodeName := user1Nodes[0].GetName()
+
+	t.Logf("Node %d (%s) created successfully", nodeID, nodeName)
+
+	// Verify node is online
+	requireAllClientsOnline(t, headscale, []types.NodeID{types.NodeID(nodeID)}, true, "node should be online initially", 120*time.Second)
+
+	// Get the client
+	client := allClients[0]
+
+	// List all preauth keys for user1
+	userMap, err := headscale.MapUsers()
+	require.NoError(t, err)
+	userID := userMap["user1"].GetId()
+
+	output, err := headscale.Execute([]string{
+		"headscale",
+		"preauthkeys",
+		"--user",
+		strconv.FormatUint(userID, 10),
+		"list",
+		"--output",
+		"json",
+	})
+	require.NoError(t, err)
+	t.Logf("Pre-auth keys before expiry:\n%s", output)
+
+	// Expire all pre-auth keys for this user (should include the one used to create the node)
+	// We list them first, then expire each one
+	output, err = headscale.Execute([]string{
+		"headscale",
+		"preauthkeys",
+		"--user",
+		strconv.FormatUint(userID, 10),
+		"list",
+		"--output",
+		"json",
+	})
+	require.NoError(t, err)
+
+	// For simplicity, we can use the integration test's CreatePreAuthKey which returns a key,
+	// but that doesn't help us identify the key already used. Instead, let's just try to
+	// expire by using a pattern or getting the key from the node info.
+
+	// Actually, the simpler approach: create a new key, get its ID, then expire it won't help.
+	// We need to expire the key that was ALREADY USED by the node.
+	// The node should have auth_key_id set. We can query this.
+
+	// Alternative simple approach: Get list of all keys, expire them all
+	// This is acceptable for a test scenario
+	t.Logf("Expiring all pre-auth keys for user1")
+
+	// Get node details to find the auth key
+	nodeDetails := user1Nodes[0]
+	authKeyID := nodeDetails.GetPreAuthKey().GetId()
+	t.Logf("Node is using auth key ID: %d", authKeyID)
+
+	// Expire this specific key
+	_, err = headscale.Execute([]string{
+		"headscale",
+		"preauthkeys",
+		"--user",
+		strconv.FormatUint(userID, 10),
+		"expire",
+		strconv.FormatUint(authKeyID, 10),
+	})
+	require.NoError(t, err)
+	t.Logf("Expired auth key: %d", authKeyID)
+
+	// Verify key is now expired
+	output, err = headscale.Execute([]string{
+		"headscale",
+		"preauthkeys",
+		"--user",
+		strconv.FormatUint(userID, 10),
+		"list",
+		"--output",
+		"json",
+	})
+	require.NoError(t, err)
+	t.Logf("Pre-auth keys after expiry:\n%s", output)
+
+	// Simulate node restart (down + up)
+	t.Logf("Restarting node after expiring its auth key")
+	err = client.Down()
+	require.NoError(t, err)
+
+	time.Sleep(3 * time.Second)
+
+	err = client.Up()
+	require.NoError(t, err)
+
+	// Verify node comes back online
+	// This will FAIL without the fix because auth key validation will reject expired key
+	// With the fix, MachineKey identity allows reconnection even with expired key
+	requireAllClientsOnline(t, headscale, []types.NodeID{types.NodeID(nodeID)}, true, "node should reconnect after restart despite expired key", 120*time.Second)
+
+	t.Logf("✓ Node successfully reconnected after its auth key was expired")
+}

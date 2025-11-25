@@ -32,6 +32,8 @@ jobs:
           - TestAuthKeyLogoutAndReloginSameUser
           - TestAuthKeyLogoutAndReloginNewUser
           - TestAuthKeyLogoutAndReloginSameUserExpiredKey
+          - TestAuthKeyMoveNode
+          - TestAuthKeyDeleteKey
           - TestOIDCAuthenticationPingAll
           - TestOIDCExpireNodesBasedOnTokenExpiry
           - TestOIDC024UserCreation
